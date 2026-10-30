@@ -19,13 +19,14 @@ input[type=file]{display:none}.btn{display:inline-block;cursor:pointer;border:0;
 </style>
 </head>
 <body><main>
-<div class="tag">PAPER STORAGE • V1</div>
+<div class="tag">PAPER STORAGE • V1.1</div>
 <h1>Read data from paper.</h1>
 <p>Photograph the A4 sheet printed by the desktop encoder. This page reads the black and white squares and reconstructs your original sentence — right on your phone.</p>
 <section class="panel">
 <label class="btn" for="photo">📷 Take photo / Choose image</label>
 <input id="photo" type="file" accept="image/*" capture="environment">
 <canvas id="preview"></canvas>
+<button id="manual" class="btn" type="button" style="display:none;margin-top:8px;background:#303d4e;color:white">Select corners manually</button>
 <div id="status">No photo selected.</div>
 </section>
 <section class="panel"><strong>Recovered text</strong><div id="decoded" style="margin-top:12px">Nothing decoded yet.</div><button id="copy" class="btn" style="display:none;margin-top:12px">Copy text</button></section>
@@ -37,6 +38,7 @@ const COLS=36, ROWS=48, GW=38, GH=50;
 const input=document.getElementById('photo'), status=document.getElementById('status');
 const preview=document.getElementById('preview'), result=document.getElementById('decoded'), copy=document.getElementById('copy');
 const ctx=preview.getContext('2d',{willReadFrequently:true});
+const manual=document.getElementById('manual');let savedImage=null,manualMode=false,taps=[];
 function crc32(bytes){let crc=0xffffffff;for(const b of bytes){crc^=b;for(let i=0;i<8;i++)crc=(crc>>>1)^((crc&1)?0xedb88320:0)}return (crc^0xffffffff)>>>0}
 function solve(A,b){const n=b.length;for(let i=0;i<n;i++){let p=i;for(let j=i+1;j<n;j++)if(Math.abs(A[j][i])>Math.abs(A[p][i]))p=j;
 if(Math.abs(A[p][i])<1e-9)throw Error('Could not estimate perspective.');[A[p],A[i]]=[A[i],A[p]];[b[p],b[i]]=[b[i],b[p]];
@@ -44,32 +46,76 @@ const v=A[i][i];for(let k=i;k<n;k++)A[i][k]/=v;b[i]/=v;
 for(let j=0;j<n;j++){if(j===i)continue;const m=A[j][i];for(let k=i;k<n;k++)A[j][k]-=m*A[i][k];b[j]-=m*b[i]}}
 return b}
 function homography(source,target){const a=[],b=[];for(let i=0;i<4;i++){const [x,y]=source[i],[u,v]=target[i];a.push([x,y,1,0,0,0,-u*x,-u*y]);b.push(u);a.push([0,0,0,x,y,1,-v*x,-v*y]);b.push(v)}const h=solve(a,b);return (x,y)=>{const d=h[6]*x+h[7]*y+1;return [(h[0]*x+h[1]*y+h[2])/d,(h[3]*x+h[4]*y+h[5])/d]}}
-function markerType(r,g,b){if(r>95&&r>g*1.45&&r>b*1.45)return 0; if(g>75&&g>r*1.4&&g>b*1.22)return 1;
-if(b>100&&b>r*1.35&&b>g*1.2)return 2;if(r>90&&b>90&&r>g*1.45&&b>g*1.45)return 3;return -1}
+function markerType(r,g,b){
+if(r>g+25&&r>b+25&&b<=g+20&&r>55)return 0;
+if(g>r+25&&g>b+9&&g>35)return 1;
+if(b>r+25&&b>g+25&&b>45)return 2;
+if(r>g+20&&b>g+10&&r>50&&b>45&&b>r*.38)return 3;
+return -1}
 function locateMarkers(pixels,w,h){const sum=Array.from({length:4},()=>({x:0,y:0,n:0}));const d=pixels.data;
-for(let y=0;y<h;y+=2)for(let x=0;x<w;x+=2){const k=(y*w+x)*4;const type=markerType(d[k],d[k+1],d[k+2]);if(type<0)continue;sum[type].x+=x;sum[type].y+=y;sum[type].n++}
-if(sum.some(s=>s.n<8))throw Error('Cannot find all four coloured corners. Move closer, include the full sheet, and improve lighting.');
+for(let y=0;y<h;y+=2)for(let x=0;x<w;x+=2){
+const k=(y*w+x)*4,type=markerType(d[k],d[k+1],d[k+2]);if(type<0)continue;
+const left=x<w*.48,right=x>w*.52,top=y<h*.48,bottom=y>h*.52;
+if(!((type===0&&left&&top)||(type===1&&right&&top)||(type===2&&right&&bottom)||(type===3&&left&&bottom)))continue;
+sum[type].x+=x;sum[type].y+=y;sum[type].n++}
+if(sum.some(s=>s.n<5))throw Error('Cannot identify all four markers. Tap Select corners manually.');
 return sum.map(s=>[s.x/s.n,s.y/s.n])}
 function sampleBrightness(image,w,h,x,y){const d=image.data;let acc=0,count=0;for(let dy=-1;dy<=1;dy++)for(let dx=-1;dx<=1;dx++){
 const xx=Math.round(x)+dx,yy=Math.round(y)+dy;if(xx<0||xx>=w||yy<0||yy>=h)continue;const j=(yy*w+xx)*4;acc+=0.2126*d[j]+0.7152*d[j+1]+0.0722*d[j+2];count++}
 return count?acc/count:255}
-function decode(image,w,h,threshold){const marker=locateMarkers(image,w,h);
+function decode(image,w,h,threshold,dx=0,dy=0,corners=null){const marker=corners||locateMarkers(image,w,h);
 const map=homography([[.5,.5],[GW-.5,.5],[GW-.5,GH-.5],[.5,GH-.5]],marker);
-const light=[];for(let y=1;y<=ROWS;y++)for(let x=1;x<=COLS;x++){const [u,v]=map(x+.5,y+.5);light.push(sampleBrightness(image,w,h,u,v))}
+const light=[];for(let y=1;y<=ROWS;y++)for(let x=1;x<=COLS;x++){const [u,v]=map(x+.5+dx,y+.5+dy);light.push(sampleBrightness(image,w,h,u,v))}
 const black=light.map(v=>v<threshold?1:0);let bytes=[];for(let i=0;i<black.length;i+=8){let val=0;for(let j=0;j<8;j++)val=(val<<1)|black[i+j];bytes.push(val)}
 if(bytes[0]!==80||bytes[1]!==83)throw Error('Header not recognised. Try a sharper, straighter photo with all corners visible.');
 const len=bytes[2]*256+bytes[3],expected=((bytes[4]*2**24)+(bytes[5]<<16)+(bytes[6]<<8)+bytes[7])>>>0;
 if(len>208)throw Error('Invalid data length. Retake the photo.');const payload=Uint8Array.from(bytes.slice(8,8+len));
 if(crc32(payload)!==expected)throw Error('Data check failed (some squares were misread). Retake photo in brighter, even light.');
 return new TextDecoder('utf-8',{fatal:true}).decode(payload)}
+const offsets=[0,-.1,.1,-.2,.2,-.3,.3,-.4,.4,-.5,.5];
+const thresholds=[125,100,150,90,110,135,165,75,180,60,195,210];
+function tryDecode(image,corners){
+let err=null;
+for(const dy of offsets)for(const dx of offsets)for(const t of thresholds){
+try{return decode(image,preview.width,preview.height,t,dx,dy,corners)}
+catch(e){err=e}}
+throw Error('No error-free decoding found. Try a clearer photo, or manually select the corners. '+(err?.message||''))}
+function success(text){
+result.textContent=text||'(Empty sentence)';
+status.textContent='✓ Recovered text! CRC32 verified — all bytes match.';
+copy.style.display='inline-block';
+manualMode=false;manual.textContent='Select corners manually';}
 input.addEventListener('change',async()=>{
-const file=input.files?.[0];if(!file)return;status.textContent='Reading image…';result.textContent='Nothing decoded yet.';copy.style.display='none';
-try{const bmp=await createImageBitmap(file);let scale=Math.min(1,1600/Math.max(bmp.width,bmp.height));preview.width=Math.round(bmp.width*scale);preview.height=Math.round(bmp.height*scale);
-ctx.drawImage(bmp,0,0,preview.width,preview.height);bmp.close();preview.style.display='block';let image=ctx.getImageData(0,0,preview.width,preview.height);
-let recovered=null,lastErr=null;for(const t of [128,150,105,175,85]){try{recovered=decode(image,preview.width,preview.height,t);break}catch(e){lastErr=e}}
-if(recovered===null)throw lastErr;
-result.textContent=recovered||'(Empty sentence)';status.textContent='✓ Successfully recovered the text. CRC32 verified: no detected bit errors.';copy.style.display='inline-block';
-}catch(e){status.textContent='Could not decode: '+e.message}}
-);
+const file=input.files?.[0];if(!file)return;
+status.textContent='Reading image…';result.textContent='Nothing decoded yet.';copy.style.display='none';taps=[];manualMode=false;
+manual.textContent='Select corners manually';
+try{
+const bmp=await createImageBitmap(file);
+const scale=Math.min(1,2000/Math.max(bmp.width,bmp.height));
+preview.width=Math.round(bmp.width*scale);preview.height=Math.round(bmp.height*scale);
+ctx.drawImage(bmp,0,0,preview.width,preview.height);bmp.close();
+preview.style.display='block';manual.style.display='inline-block';
+savedImage=ctx.getImageData(0,0,preview.width,preview.height);
+await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+success(tryDecode(savedImage,locateMarkers(savedImage,preview.width,preview.height)));
+}catch(e){status.textContent='Automatic decode failed: '+e.message}});
+manual.addEventListener('click',()=>{
+if(!savedImage)return;
+manualMode=!manualMode;taps=[];
+ctx.putImageData(savedImage,0,0);
+manual.textContent=manualMode?'Cancel manual selection':'Select corners manually';
+status.textContent=manualMode?'Tap the centre of the RED marker (top left).':'Manual selection cancelled.';});
+preview.addEventListener('click',async e=>{
+if(!manualMode||!savedImage)return;
+const rect=preview.getBoundingClientRect();
+const x=(e.clientX-rect.left)*preview.width/rect.width,y=(e.clientY-rect.top)*preview.height/rect.height;
+taps.push([x,y]);const colors=['#ff4444','#00ef86','#2678ff','#ef48a5'];
+ctx.beginPath();ctx.arc(x,y,Math.max(7,preview.width/90),0,Math.PI*2);ctx.lineWidth=4;ctx.strokeStyle=colors[taps.length-1];ctx.stroke();
+const names=['RED','GREEN','BLUE','PINK'];
+if(taps.length<4){status.textContent='Now tap '+names[taps.length]+' marker.';return}
+status.textContent='Checking your selected corners…';
+await new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
+try{success(tryDecode(savedImage,taps))}catch(e){status.textContent='Manual decode failed: '+e.message+' Cancel selection and retry.'}
+});
 copy.addEventListener('click',()=>navigator.clipboard?.writeText(result.textContent));
 </script></body></html>
